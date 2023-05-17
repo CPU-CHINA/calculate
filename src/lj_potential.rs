@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 use ordered_float::OrderedFloat;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyList};
+use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
+
 
 #[derive(Eq, PartialEq)]
 struct Molecule {
@@ -10,7 +11,7 @@ struct Molecule {
     // bonds: Vec<Vec<usize>>,
     angles: Vec<Vec<usize>>,
     // dihedrals: Vec<Vec<Vec<usize>>>,
-    locations: HashMap<String, (OrderedFloat<f64>, OrderedFloat<f64>, OrderedFloat<f64>)>,
+    cartesian: HashMap<String, (OrderedFloat<f64>, OrderedFloat<f64>, OrderedFloat<f64>)>,
 }
 
 // 从 PyList 中获取三个元素，并将它们包装成 OrderedFloat<f64> 类型
@@ -43,7 +44,7 @@ fn create_mole(forest: &PyDict, name: Option<&String>, mole_loc: &PyDict) -> Res
         // bonds: forest_dict.get_item("[bonds]").unwrap().downcast::<PyList>()?.extract()?,
         angles: forest_dict.get_item("[angles]").unwrap().downcast::<PyList>()?.extract()?,
         // dihedrals: forest_dict.get_item("[dihedrals]").unwrap().downcast::<PyList>()?.extract()?,
-        locations,
+        cartesian: locations,
     };
     Ok(molecule)
 }
@@ -70,13 +71,10 @@ fn create_forest(moles: &Vec<String>, forest: &PyDict, mole_loc: &PyDict) -> Res
     Ok(forest_out)
 }
 
-fn ca_need_atom<'a>(tree_dict: &Vec<Vec<usize>>, atom_set: Vec<&'a usize>, atom: &usize) -> Vec<&'a usize> {
-    let mut atom_set = atom_set.clone();
+fn ca_need_atom<'a>(tree_dict: &Vec<Vec<usize>>, mut atom_set: Vec<&'a usize>, atom: &usize) -> Vec<&'a usize> {
     for angle in tree_dict {
-        if angle.contains(&atom) {
-            let mut angle = angle.clone();
-            angle.retain(|&x| x != *atom);
-            atom_set.retain(|&x| !angle.contains(&x));
+        if angle.contains(atom) {
+            atom_set.retain(|&x| !angle.iter().any(|&y| y != *atom && y == *x));
         }
     }
     atom_set.retain(|&x| x != atom);
@@ -103,27 +101,31 @@ impl CalculateLjPotential {
         Ok(CalculateLjPotential { cc_lib })
     }
 
-    fn calculate(&self, moles: &PyList, forest: &PyDict, mole_loc: &PyDict, lj_cutoff: &PyBool) -> PyResult<f64> {
-        let moles = moles.extract::<Vec<String>>()?;
+    fn calculate(&self, moles: Vec<String>, forest: &PyDict, mole_loc: &PyDict, lj_cutoff: bool) -> PyResult<f64> {
         let forest: HashMap<String, Molecule> = create_forest(&moles, forest, mole_loc)?;
-        let lj_cutoff: bool = lj_cutoff.extract()?;
 
         let e_lj = moles.par_iter().map(|mole| {
+            let mut atom_set = Vec::new();
+            let mut bond = String::new();
+
             if let Some(molecule) = forest.get(mole) {
-                let mut atom_set = molecule.atoms.keys().collect::<Vec<&usize>>();
+                atom_set.extend(molecule.atoms.keys());
                 let mut e_lj_mole = 0.0;
-                for atom1 in molecule.atoms.keys().collect::<Vec<&usize>>() {
+                for atom1 in molecule.atoms.keys() {
                     atom_set = ca_need_atom(&molecule.angles, atom_set, atom1);
                     for atom2 in &atom_set {
-                        let a = molecule.locations[&atom1.to_string()];
-                        let b = molecule.locations[&atom2.to_string()];
+                        let a = molecule.cartesian[&atom1.to_string()];
+                        let b = molecule.cartesian[&atom2.to_string()];
                         let dis = get_distance(&a, &b);
                         if lj_cutoff && dis > 1.4 {
                             continue;
                         } else {
                             let atom_type = vec![&molecule.atoms.get(atom1).unwrap()[1],
                                                  &molecule.atoms.get(atom2).unwrap()[1]];
-                            let bond = format!("{}_{}", atom_type[0], atom_type[1]);
+                            bond.clear();
+                            bond.push_str(atom_type[0]);
+                            bond.push('_');
+                            bond.push_str(atom_type[1]);
                             let c12_c6 = &self.cc_lib.get(&bond).unwrap();
                             e_lj_mole += c12_c6[0] / dis.powi(12) - c12_c6[1] / dis.powi(6);
                         }
